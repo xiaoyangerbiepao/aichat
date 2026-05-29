@@ -139,10 +139,29 @@ const App: React.FC = () => {
       }
     } catch (error) {
       console.error('请求失败:', error)
+      
+      let errorContent: string
+      if (error instanceof Error) {
+        if (error.message.includes('Failed to fetch')) {
+          errorContent = `🌐 网络连接失败\n\n请检查您的网络连接，然后重试。`
+        } else if (error.message.includes('401') || error.message.includes('403')) {
+          errorContent = `🔑 API 密钥错误\n\n请检查您的 API 密钥配置是否正确。`
+        } else if (error.message.includes('500') || error.message.includes('503')) {
+          errorContent = `🔧 服务暂时不可用\n\nAI 服务正在维护中，请稍后重试。`
+        } else if (error.message.includes('429')) {
+          errorContent = `⏱️ 请求过于频繁\n\n请稍等片刻再发送消息。`
+        } else {
+          errorContent = `❌ 发生错误\n\n${error.message}\n\n请稍后重试。`
+        }
+      } else {
+        errorContent = `❌ 发生未知错误\n\n请稍后重试，或联系技术支持。`
+      }
+      
       const errorMessage: Message = {
         role: 'assistant',
-        content: `抱歉，发生了错误：${error instanceof Error ? error.message : '未知错误'}。请稍后重试。`,
-        timestamp: Date.now()
+        content: errorContent,
+        timestamp: Date.now(),
+        isError: true
       }
       const errorMessages = [...newMessages, errorMessage]
       setMessages(errorMessages)
