@@ -1,238 +1,89 @@
-import React, { useState, useEffect } from 'react'
-import { ChatInterface, Message } from './components'
-import { saveChatHistory, loadChatHistory, clearChatHistory } from './utils/storage'
+import { useState } from 'react'
+import { ChatInterface } from './components'
+import type { Message } from './components'
+import Login from './components/Login'
+import { getToken, request } from '../utils/index.js'
 
-export interface MessageRecord {
-  id: string
-  message: Message
-  timestamp: number
-}
+// 走 vite 代理，实际请求的是 http://localhost:8000/qa/chat/stream
+const STREAM_URL = '/qa/chat/stream'
 
-const App: React.FC = () => {
+export default function App() {
+  const [token, setToken] = useState(getToken())
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
-  const [messageRecords, setMessageRecords] = useState<MessageRecord[]>([])
-  const [activeMessageId, setActiveMessageId] = useState<string | null>(null)
 
-  // 从 localStorage 加载对话历史
-  useEffect(() => {
-    const savedData = loadChatHistory()
-    if (savedData) {
-      setMessages(savedData.messages)
-      setMessageRecords(savedData.messageRecords)
-    }
-  }, [])
-
-  // 保存对话历史到 localStorage
-  useEffect(() => {
-    if (messages.length > 0 || messageRecords.length > 0) {
-      saveChatHistory(messages, messageRecords)
-    }
-  }, [messages, messageRecords])
-
-  // 添加消息记录
-  const addMessageRecord = (message: Message) => {
-    const record: MessageRecord = {
-      id: Date.now().toString(),
-      message: { ...message },
-      timestamp: Date.now()
-    }
-    setMessageRecords(prev => [record, ...prev])
-  }
-
-  // 查看消息详情
-  const viewMessageDetail = (id: string) => {
-    setActiveMessageId(id)
-  }
-
-
+  // 后端每帧形如 {"type":"token","content":"..."}，
+  // progress / meta / done 三类帧不带正文，直接忽略
+  const getDelta = (chunk: any): string => (chunk?.type === 'token' ? chunk.content : '')
 
   const handleSend = async () => {
-    if (!input.trim() || isLoading) return
+    const text = input.trim()
+    if (!text || isLoading) return
 
-    const userMessage: Message = {
-      role: 'user',
-      content: input,
-      timestamp: Date.now()
-    }
-
-    const allMessages = [...messages, userMessage].map(m => ({
-      role: m.role,
-      content: m.content
-    }))
-
-    const newMessages = [...messages, userMessage]
-    setMessages(newMessages)
-    addMessageRecord(userMessage)
     setInput('')
     setIsLoading(true)
-
-    const apiUrl = import.meta.env.VITE_API_BASE_URL
-    const apiKey = import.meta.env.VITE_API_KEY
+    // 先插入用户消息和一条空的 AI 消息，流式内容不断往空消息上追加
+    setMessages((prev) => [
+      ...prev,
+      { role: 'user', content: text, timestamp: Date.now() },
+      { role: 'assistant', content: '', timestamp: Date.now() }
+    ])
 
     try {
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: 'glm-4-flash',
-          messages: allMessages,
-          stream: true
-        })
-      })
+      await request(
+        'POST',
+        STREAM_URL,
+        { session_id: 'string', message: text, enable_web_search: false },
+        {
+          stream: true,
+          onMessage: (chunk) => {
+            console.log('SSE 帧:', chunk)
+            const delta = getDelta(chunk)
+            if (!delta) return
 
-      if (!response.ok) {
-        const errorText = await response.text()
-        throw new Error(`API 请求失败: ${response.status} - ${errorText}`)
-      }
-
-      const reader = response.body?.getReader()
-      const decoder = new TextDecoder()
-
-      let assistantMessage: Message = {
-        role: 'assistant',
-        content: '',
-        timestamp: Date.now()
-      }
-
-      const updatedMessages = [...newMessages, assistantMessage]
-      setMessages(updatedMessages)
-      addMessageRecord(assistantMessage)
-
-      let buffer = ''
-      while (reader) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() || ''
-
-        for (const line of lines) {
-          const trimmed = line.trim()
-          if (!trimmed || !trimmed.startsWith('data: ')) continue
-          const data = trimmed.slice(6)
-          if (data === '[DONE]') continue
-
-          try {
-            const parsed = JSON.parse(data)
-            const content = parsed.choices?.[0]?.delta?.content
-            if (content) {
-              assistantMessage = {
-                ...assistantMessage,
-                content: assistantMessage.content + content
-              }
-              const updatedMessagesList = [
-                  ...newMessages,
-                  { ...assistantMessage }
-                ]
-                setMessages(updatedMessagesList)
-            }
-          } catch (e) {
-            console.error('解析数据失败:', e)
+            // 必须用函数式更新：回调闭包里的 messages 永远是旧快照，直接取值会丢掉前面的增量
+            setMessages((prev) => {
+              const next = [...prev]
+              const last = next[next.length - 1]
+              next[next.length - 1] = { ...last, content: last.content + delta }
+              return next
+            })
           }
         }
-      }
+      )
     } catch (error) {
-      console.error('请求失败:', error)
-      
-      let errorContent: string
-      if (error instanceof Error) {
-        if (error.message.includes('Failed to fetch')) {
-          errorContent = `🌐 网络连接失败\n\n请检查您的网络连接，然后重试。`
-        } else if (error.message.includes('401') || error.message.includes('403')) {
-          errorContent = `🔑 API 密钥错误\n\n请检查您的 API 密钥配置是否正确。`
-        } else if (error.message.includes('500') || error.message.includes('503')) {
-          errorContent = `🔧 服务暂时不可用\n\nAI 服务正在维护中，请稍后重试。`
-        } else if (error.message.includes('429')) {
-          errorContent = `⏱️ 请求过于频繁\n\n请稍等片刻再发送消息。`
-        } else {
-          errorContent = `❌ 发生错误\n\n${error.message}\n\n请稍后重试。`
-        }
-      } else {
-        errorContent = `❌ 发生未知错误\n\n请稍后重试，或联系技术支持。`
-      }
-      
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: errorContent,
-        timestamp: Date.now(),
-        isError: true
-      }
-      const errorMessages = [...newMessages, errorMessage]
-      setMessages(errorMessages)
-      addMessageRecord(errorMessage)
+      const message = error instanceof Error ? error.message : '请求失败'
+      setMessages((prev) => {
+        const next = [...prev]
+        next[next.length - 1] = { ...next[next.length - 1], content: message, isError: true }
+        return next
+      })
     } finally {
+      // 流结束（或出错）才解除禁用，避免重复发送
       setIsLoading(false)
     }
   }
 
-  const handleClear = () => {
-    if (window.confirm('确定要清空所有对话历史吗？')) {
-      setMessages([])
-      setMessageRecords([])
-      clearChatHistory()
-    }
-  }
-
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
-    }
+  // 没登录过（LocalStorage 里没有 token）就先显示登录页
+  if (!token) {
+    return <Login onSuccess={setToken} />
   }
 
   return (
-    <div className="flex h-screen">
-      <div className="flex-1 flex flex-col">
-        <ChatInterface
-          messages={messages}
-          input={input}
-          isLoading={isLoading}
-          onInputChange={setInput}
-          onSend={handleSend}
-          onClear={handleClear}
-          onKeyPress={handleKeyPress}
-        />
-      </div>
-      
-      <div className="sidebar">
-        <div className="sidebar-header">
-          <div className="flex justify-between items-center">
-            <span className="sidebar-title">消息记录</span>
-            <button
-              onClick={handleClear}
-              className="text-blue-500 hover:text-blue-700 text-sm"
-            >
-              清空记录
-            </button>
-          </div>
-        </div>
-        <div className="divide-y divide-gray-200">
-          {messageRecords.map(record => (
-            <div
-              key={record.id}
-              className={`conversation-item ${record.id === activeMessageId ? 'active' : ''}`}
-              onClick={() => viewMessageDetail(record.id)}
-            >
-              <div className="conversation-preview">
-                {record.message.role === 'user' ? '👤 ' : '🤖 '}
-                {record.message.content.substring(0, 30)}
-                {record.message.content.length > 30 ? '...' : ''}
-              </div>
-              <div className="conversation-time">
-                {new Date(record.timestamp).toLocaleTimeString()}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </div>
+    <ChatInterface
+      messages={messages}
+      input={input}
+      isLoading={isLoading}
+      onInputChange={setInput}
+      onSend={handleSend}
+      onClear={() => setMessages([])}
+      onKeyPress={(e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault()
+          handleSend()
+        }
+      }}
+    />
   )
 }
-
-export default App
